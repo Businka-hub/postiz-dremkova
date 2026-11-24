@@ -5,9 +5,10 @@ problem (Telegram and/or a generic webhook):
   - channel needs reconnect (refreshNeeded / disabled / stuck in inBetweenSteps)
   - post failed (state ERROR)
   - post stuck in QUEUE more than STUCK_MINUTES after its publish date
+  - Meta rejected a channel token (checked every TOKEN_CHECK_HOURS, before a post fails)
 Sends a daily summary at SUMMARY_HOUR (server time) of the next 24 h.
 """
-import json, os, time, urllib.request, datetime as dt
+import json, os, time, urllib.error, urllib.parse, urllib.request, datetime as dt
 import psycopg
 
 DB = os.environ["DATABASE_URL"]
@@ -19,6 +20,9 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 WEBHOOK = os.environ.get("ALERT_WEBHOOK_URL", "")
 APP_URL = os.environ.get("APP_URL", "")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
+TOKEN_HOURS = float(os.environ.get("TOKEN_CHECK_HOURS", "6"))
+META_HOSTS = {"facebook": "graph.facebook.com", "instagram": "graph.facebook.com",
+              "instagram-standalone": "graph.instagram.com"}
 
 
 def load_state():
@@ -49,8 +53,35 @@ def send(text):
         urllib.request.urlopen(req, timeout=15).read()
 
 
-def problems(cur):
-    out = []
+def dead_tokens(cur):
+    """Ask Meta whether each channel token still works. Only an explicit OAuth
+    error (code 190) counts; network trouble is ignored."""
+    out = {}
+    cur.execute('''select id, name, "providerIdentifier", "internalId", token from "Integration"
+                   where "deletedAt" is null and not disabled and not "refreshNeeded"
+                   and "providerIdentifier" = any(%s)''', (list(META_HOSTS),))
+    for iid, name, prov, internal, token in cur.fetchall():
+        path = "me" if prov == "instagram-standalone" else internal
+        url = (f"https://{META_HOSTS[prov]}/v21.0/{path}?fields=id&access_token="
+               + urllib.parse.quote(token.split("___")[0]))
+        try:
+            urllib.request.urlopen(url, timeout=15).read()
+        except urllib.error.HTTPError as e:
+            try:
+                err = json.load(e).get("error", {})
+            except Exception:
+                continue
+            if err.get("code") == 190:
+                out[f"tok:{iid}"] = (f"🔑 Kanál {name} ({prov}) – Meta zneplatnila přihlášení, "
+                                     f"další post by selhal. Znovu připoj jeden kanál a spusť "
+                                     f"custom/tokens/refresh_meta_tokens.py. {APP_URL}/launches")
+        except Exception:
+            continue
+    return out
+
+
+def problems(cur, state):
+    out = list(state.get("dead_tokens", {}).items())
     cur.execute('''select id, name, "providerIdentifier", disabled, "refreshNeeded", "inBetweenSteps"
                    from "Integration" where "deletedAt" is null
                    and (disabled or "refreshNeeded" or "inBetweenSteps")''')
@@ -86,7 +117,10 @@ def summary(cur):
 
 def tick(state):
     with psycopg.connect(DB, connect_timeout=10) as conn, conn.cursor() as cur:
-        current = problems(cur)
+        if time.time() - state.get("token_checked", 0) > TOKEN_HOURS * 3600:
+            state["dead_tokens"] = dead_tokens(cur)
+            state["token_checked"] = time.time()
+        current = problems(cur, state)
         keys = {k for k, _ in current}
         for k, msg in current:
             if k not in state["seen"]:
@@ -95,8 +129,8 @@ def tick(state):
         # forget resolved problems so a relapse alerts again
         for k in list(state["seen"]):
             if k not in keys:
-                if k.startswith("ch:"):
-                    name = state["seen"][k].split(" – ")[0].replace("⚠️ Kanál ", "")
+                if k.startswith(("ch:", "tok:")):
+                    name = state["seen"][k].split(" – ")[0].replace("⚠️ Kanál ", "").replace("🔑 Kanál ", "")
                     send(f"✅ Kanál {name} je zase v pořádku.")
                 del state["seen"][k]
         today = dt.date.today().isoformat()
