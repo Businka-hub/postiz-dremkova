@@ -56,6 +56,10 @@ export class InstagramDto {
   @IsOptional()
   is_trial_reel?: boolean;
 
+  // self-disclosure of AI usage → Instagram „AI info“ label (Graph API is_ai_generated)
+  @IsOptional()
+  is_ai_generated?: boolean;
+
   @IsIn(['MANUAL', 'SS_PERFORMANCE'])
   @IsOptional()
   graduation_strategy?: 'MANUAL' | 'SS_PERFORMANCE';

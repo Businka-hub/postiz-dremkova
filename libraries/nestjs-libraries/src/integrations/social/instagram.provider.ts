@@ -721,6 +721,8 @@ export class InstagramProvider
           )}`
         : ``;
     const isTrialReel = this.assetBoolean(firstPost.settings.is_trial_reel);
+    // AI info label: only on a single-media container (not stories, not carousel children)
+    const isAiGenerated = this.assetBoolean(firstPost.settings.is_ai_generated);
     const medias = await Promise.all(
       firstPost?.media?.map(async (m) => {
         const caption =
@@ -788,16 +790,36 @@ export class InstagramProvider
               )}`
             : ``;
 
-        const { id: photoId } = await (
-          await this.fetch(
-            `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?${mediaType}${isCarousel}${itemCollaborators}${trialParams}${audioConfiguration}&access_token=${accessToken}${caption}`,
-            {
-              method: 'POST',
-            }
-          )
-        ).json();
+        const aiLabel =
+          isAiGenerated && !isStory && firstPost?.media?.length === 1
+            ? `&is_ai_generated=true`
+            : ``;
+        const createContainer = async (ai: string) => {
+          const res = await (
+            await this.fetch(
+              `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?${mediaType}${isCarousel}${itemCollaborators}${trialParams}${audioConfiguration}${ai}&access_token=${accessToken}${caption}`,
+              {
+                method: 'POST',
+              }
+            )
+          ).json();
+          // with the label, a missing id must trigger the retry without it
+          if (ai && !res?.id) {
+            throw new Error(JSON.stringify(res?.error || res));
+          }
+          return res.id;
+        };
 
-        return photoId;
+        if (!aiLabel) {
+          return createContainer(``);
+        }
+        try {
+          return await createContainer(aiLabel);
+        } catch (err) {
+          // the label must never block publishing: retry once without it
+          console.warn('[instagram] is_ai_generated rejected, publishing without the AI label', err);
+          return createContainer(``);
+        }
       }) || []
     );
 
@@ -827,6 +849,7 @@ export class InstagramProvider
                 ),
               }
             : {}),
+          ...(isAiGenerated && !isStory && medias.length > 1 ? { aiGenerated: true } : {}),
         },
       },
     ];
@@ -841,6 +864,7 @@ export class InstagramProvider
       message?: string;
       carouselId?: string;
       collaborators?: string[];
+      aiGenerated?: boolean;
     },
     integration: Integration
   ): Promise<PendingCheckResponse> {
@@ -908,6 +932,7 @@ export class InstagramProvider
       message?: string;
       carouselId?: string;
       collaborators?: string[];
+      aiGenerated?: boolean;
     },
     integration: Integration
   ): Promise<PendingCheckResponse> {
@@ -970,7 +995,7 @@ export class InstagramProvider
                   JSON.stringify(pendingData.collaborators)
                 )}`
               : ``
-          }&access_token=${accessToken}`,
+          }${pendingData.aiGenerated ? `&is_ai_generated=true` : ``}&access_token=${accessToken}`,
           {
             method: 'POST',
           }
